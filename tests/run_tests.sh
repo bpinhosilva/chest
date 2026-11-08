@@ -14,7 +14,8 @@ export GNUPGHOME="${TMP_ROOT}/gnupg"
 mkdir -m 700 "$GNUPGHOME"
 
 cleanup() {
-  gpgconf --homedir "$GNUPGHOME" --kill all >/dev/null 2>&1 || true
+  gpgconf --homedir "${GNUPGHOME:-}" --kill all >/dev/null 2>&1 || true
+  [ -z "${OTHER_GNUPGHOME:-}" ] || gpgconf --homedir "$OTHER_GNUPGHOME" --kill all >/dev/null 2>&1 || true
   rm -rf "$TMP_ROOT"
 }
 trap cleanup EXIT
@@ -205,5 +206,83 @@ CHEST_PASSWORD="envpass456" "$CHEST" backup -s "$SRC" -o "$ARCHIVE_ENV"
 CHEST_PASSWORD="envpass456" "$CHEST" restore -i "$ARCHIVE_ENV" -o "$RESTORE_ENV"
 [ "$(cat "$RESTORE_ENV/data/file.txt")" = "hello world" ] || fail "CHEST_PASSWORD backup/restore failed"
 pass "CHEST_PASSWORD environment variable verified"
+
+# 15. CHEST_PASSWORD must not read as -p and must not override public-key mode
+ARCHIVE_ENVKEY="${OUT}/envkey.tar.gz.gpg"
+RESTORE_ENVKEY="${TMP_ROOT}/restored_envkey"
+CHEST_PASSWORD="envpass456" "$CHEST" backup -s "$SRC" -o "$ARCHIVE_ENVKEY" -r "$KEY_EMAIL" \
+  || fail "CHEST_PASSWORD should not block public-key mode"
+[ -f "$ARCHIVE_ENVKEY" ] || fail "Public-key archive not created with CHEST_PASSWORD set"
+CHEST_PASSWORD="envpass456" "$CHEST" restore -i "$ARCHIVE_ENVKEY" -o "$RESTORE_ENVKEY"
+[ "$(cat "$RESTORE_ENVKEY/data/file.txt")" = "hello world" ] || fail "CHEST_PASSWORD broken the key-mode restore"
+pass "CHEST_PASSWORD does not conflict with, or override, public-key mode"
+
+# 16. Unknown recipient fails before any archive is written
+if "$CHEST" backup -s "$SRC" -o "${TMP_ROOT}/unknown.tar.gz.gpg" -r "nobody@example.invalid" >/dev/null 2>&1; then
+  fail "Unknown recipient should fail"
+fi
+[ ! -e "${TMP_ROOT}/unknown.tar.gz.gpg" ] || fail "Unknown recipient left an archive behind"
+pass "Unknown recipient rejected"
+
+# 17. A failed restore leaves the destination untouched
+"$CHEST" backup -s "$SRC" -o "${OUT}/atomic.tar.gz.gpg" -p "rightpass" >/dev/null
+DEST_ATOMIC="${TMP_ROOT}/restored_atomic"
+mkdir -p "$DEST_ATOMIC"
+echo keep > "$DEST_ATOMIC/sentinel.txt"
+if "$CHEST" restore -i "${OUT}/atomic.tar.gz.gpg" -o "$DEST_ATOMIC" -p "wrongpass" >/dev/null 2>&1; then
+  fail "Wrong password should fail"
+fi
+[ "$(cat "$DEST_ATOMIC/sentinel.txt")" = "keep" ] || fail "Failed restore modified the destination"
+[ ! -e "$DEST_ATOMIC/data" ] || fail "Failed restore extracted files into the destination"
+[ -z "$(find "${TMP_ROOT}" -maxdepth 1 -name 'restored_atomic.partial.*' -print -quit)" ] \
+  || fail "Failed restore left a staging directory behind"
+pass "Failed restore leaves the destination untouched"
+
+# 18. Non-OpenPGP input is rejected with a clear message
+echo "not an archive" > "${TMP_ROOT}/plain.txt"
+if PLAIN_MSG="$("$CHEST" restore -i "${TMP_ROOT}/plain.txt" -o "${TMP_ROOT}/restored_plain" 2>&1)"; then
+  fail "Non-OpenPGP input should fail"
+fi
+grep -q 'not an OpenPGP-encrypted archive' <<<"$PLAIN_MSG" \
+  || fail "Non-OpenPGP input error message unclear: $PLAIN_MSG"
+pass "Non-OpenPGP input rejected with a clear message"
+
+# 19. Passwordless restore of a passphrase-protected key (gpg-agent supplies it)
+PROT_EMAIL="chest-protected@example.com"
+PROT_PASS="protpass789"
+gpg --batch --pinentry-mode loopback --passphrase "$PROT_PASS" \
+  --quick-generate-key "$PROT_EMAIL" default default never >/dev/null 2>&1 \
+  || fail "test setup: protected key generation failed"
+PRESET="$(command -v gpg-preset-passphrase 2>/dev/null || true)"
+[ -n "$PRESET" ] || PRESET="$(ls /usr/lib/gnupg/gpg-preset-passphrase 2>/dev/null || true)"
+if [ -n "$PRESET" ]; then
+  grep -q '^allow-preset-passphrase' "${GNUPGHOME}/gpg-agent.conf" 2>/dev/null \
+    || echo allow-preset-passphrase >> "${GNUPGHOME}/gpg-agent.conf"
+  gpgconf --reload gpg-agent >/dev/null 2>&1 || true
+  ARCHIVE_PROT="${OUT}/protected.tar.gz.gpg"
+  RESTORE_PROT="${TMP_ROOT}/restored_protected"
+  "$CHEST" backup -s "$SRC" -o "$ARCHIVE_PROT" -r "$PROT_EMAIL"
+  while IFS= read -r grip; do
+    printf '%s' "$PROT_PASS" | "$PRESET" --preset "$grip" >/dev/null 2>&1 || true
+  done < <(gpg --batch --with-colons --with-keygrip --list-secret-keys "$PROT_EMAIL" \
+             | awk -F: '/^grp:/ {print $10}')
+  "$CHEST" restore -i "$ARCHIVE_PROT" -o "$RESTORE_PROT"
+  [ "$(cat "$RESTORE_PROT/data/file.txt")" = "hello world" ] \
+    || fail "Passwordless restore of a protected key failed"
+  pass "Passwordless restore of a passphrase-protected key (agent cache)"
+else
+  echo "[SKIP] gpg-preset-passphrase unavailable; protected-key restore not exercised"
+fi
+
+# 20. Restoring without the private key explains what is missing
+OTHER_GNUPGHOME="${TMP_ROOT}/gnupg-nokey"
+mkdir -m 700 "$OTHER_GNUPGHOME"
+if NOPRIV_MSG="$(GNUPGHOME="$OTHER_GNUPGHOME" "$CHEST" restore -i "$ARCHIVE_KEY" -o "${TMP_ROOT}/restored_nokey" 2>&1)"; then
+  fail "Restore without the private key should fail"
+fi
+grep -q 'encrypted to a public key' <<<"$NOPRIV_MSG" \
+  || fail "Missing private key message unclear: $NOPRIV_MSG"
+[ ! -e "${TMP_ROOT}/restored_nokey" ] || fail "Failed restore created the destination"
+pass "Missing private key reported clearly"
 
 echo "All tests passed!"
