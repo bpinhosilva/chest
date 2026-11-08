@@ -149,9 +149,11 @@ Instead of a password, you can encrypt backups to a GPG **public key** with `-r`
 **1. Generate a dedicated backup key** (on your trusted machine, e.g. your desktop — the machine that will restore). A key used only for backups keeps your main identity key offline:
 
 ```bash
-# RSA-4096 sign+encrypt key, no expiry (or set "1y" and rotate)
-gpg --quick-generate-key "Backup Key <you@example.com>" rsa4096 encr4096 never
+# RSA-4096 key that can encrypt and certify, no expiry (or set "1y" and rotate)
+gpg --quick-generate-key "Backup Key <you@example.com>" rsa4096 encr never
 ```
+
+This creates an encrypt+certify-only key: it encrypts backups and cross-signs certifications, which is all a backup key needs. If you would rather pick every detail (algorithm, subkeys, expiry) interactively, use `gpg --full-generate-key` and choose "RSA and RSA" with an encryption subkey.
 
 You'll be asked for a passphrase — this protects the private key. Choose a strong one and store it in your password manager; losing the passphrase **and** the key means losing every encrypted archive.
 
@@ -189,7 +191,14 @@ echo "<FINGERPRINT>:6:" | gpg --import-ownertrust
 
 - **Backup machine** needs only the public key — unattended and secretless.
 - **Restore machine** needs the private key; gpg-agent caches its passphrase after the first decrypt of a session (`~/.gnupg/gpg-agent.conf`: `default-cache-ttl` / `max-cache-ttl` tune how long).
-- **Add a second recovery recipient** by passing `-r` twice — either private key can decrypt: `chest backup ... -r you@example.com -r recovery@example.com`.
+- **Unattended restores**: the first decrypt after the agent starts needs the passphrase from a pinentry, so a headless run (cron, systemd) fails unless the passphrase is already cached or preset. Either run one restore interactively to warm the cache, or preset it. Presetting needs `allow-preset-passphrase` in `gpg-agent.conf` and the keygrip from `gpg --with-keygrip --list-secret-keys`:
+
+  ```bash
+  echo allow-preset-passphrase >> ~/.gnupg/gpg-agent.conf && gpgconf --reload gpg-agent
+  /usr/lib/gnupg/gpg-preset-passphrase --preset <KEYGRIP>   # reads the passphrase on stdin
+  ```
+- **Add a second recovery recipient** by passing `-r` twice — either private key can decrypt: `chest backup ... -r you@example.com -r recovery@example.com`. When several keys share a user ID, pass the fingerprint instead of the email to be sure which one is used.
+- **`CHEST_PASSWORD` is only used for symmetric archives.** On a public-key archive it is ignored, unless you pass `-p` explicitly, in which case it is used as the private key's passphrase.
 - Losing the private key means losing every key-encrypted archive — keep the offline export safe.
 
 ```bash
