@@ -327,7 +327,7 @@ cmd_restore() {
   local packets
   # gpg may exit non-zero when it cannot decrypt the packet bodies while
   # listing; only the packet dump matters here, so ignore its exit status.
-  packets="$(gpg --batch --list-packets "$archive" 2>/dev/null || true)"
+  packets="$(gpg --batch --pinentry-mode cancel --list-packets "$archive" 2>/dev/null || true)"
   if grep -q ':symkey enc packet:' <<<"$packets"; then
     is_symmetric=1
   fi
