@@ -144,22 +144,65 @@ Notes:
 
 Instead of a password, you can encrypt backups to a GPG **public key** with `-r` / `--recipient` (key ID, fingerprint, or email; repeatable for multiple recipients). This is ideal for unattended backups: the machine running the backup holds no secret — only the private key can decrypt.
 
+#### Setting up the key pair
+
+**1. Generate a dedicated backup key** (on your trusted machine, e.g. your desktop — the machine that will restore). A key used only for backups keeps your main identity key offline:
+
 ```bash
-# On the backup machine: import the public key once, then back up
-gpg --import backup-public-key.asc
+# RSA-4096 sign+encrypt key, no expiry (or set "1y" and rotate)
+gpg --quick-generate-key "Backup Key <you@example.com>" rsa4096 encr4096 never
+```
+
+You'll be asked for a passphrase — this protects the private key. Choose a strong one and store it in your password manager; losing the passphrase **and** the key means losing every encrypted archive.
+
+**2. Export both halves:**
+
+```bash
+# Public key: goes to the backup machine(s)
+gpg --armor --export "you@example.com" > chest-backup-public.asc
+
+# Private key: keep an OFFLINE copy (USB stick, encrypted vault) — never on the backup machine
+gpg --armor --export-secret-keys "you@example.com" > chest-backup-private.asc
+```
+
+**3. Import on each machine:**
+
+```bash
+# On the backup machine(s): public key only
+gpg --import chest-backup-public.asc
+
+# On the restore machine: the private key
+gpg --import chest-backup-private.asc
+```
+
+If a machine has several keys, `chest` targets exactly the one you name with `-r` (email, key ID, or fingerprint — `gpg --list-keys --keyid-format long` shows them).
+
+**4. Trust the public key on the backup machine** (imported keys start untrusted; `chest` uses `--trust-model always` so encryption works regardless, but trusting avoids gpg warnings elsewhere):
+
+```bash
+echo "<FINGERPRINT>:6:" | gpg --import-ownertrust
+```
+
+**5. Protect the private key copy:** once verified, delete `chest-backup-private.asc` from disk (`shred -u chest-backup-private.asc`), keep the offline copy, and store the public key file wherever you like.
+
+#### Key handling notes
+
+- **Backup machine** needs only the public key — unattended and secretless.
+- **Restore machine** needs the private key; gpg-agent caches its passphrase after the first decrypt of a session (`~/.gnupg/gpg-agent.conf`: `default-cache-ttl` / `max-cache-ttl` tune how long).
+- **Add a second recovery recipient** by passing `-r` twice — either private key can decrypt: `chest backup ... -r you@example.com -r recovery@example.com`.
+- Losing the private key means losing every key-encrypted archive — keep the offline export safe.
+
+```bash
 chest backup -s ~/Documents -o ~/backups -r you@example.com
 ```
 
 - **Restore** requires the matching private key (plus its passphrase, cached by gpg-agent). The archive type is detected automatically, so restore works the same way — just omit `-p`:
 
 ```bash
-# On the restore machine: import the private key once, then restore
-gpg --import private-key.asc
 chest restore -i ~/backups/Documents_20261017_153000.tar.gz.gpg -o /tmp/restored
 ```
 
 - `-p` and `-r` are mutually exclusive; pick one mode per backup.
-- Losing the private key means losing every key-encrypted archive — keep a safe offline copy (or add a second `-r` recipient as a recovery key).
 
 ### 5. Restore a Backup
 
