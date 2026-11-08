@@ -87,7 +87,9 @@ Restore Options:
   -v, --verbose             Print each file path as it is restored
 
 The archive type (symmetric password vs. GPG public key) is detected
-automatically during restore; no extra flag is needed.
+automatically during restore; no extra flag is needed. $CHEST_PASSWORD is
+only used for symmetric (password) archives: public-key archives need no
+password, gpg-agent handles the private key.
 
 Examples:
   # Preview estimated backup size in GB
@@ -139,6 +141,7 @@ cmd_backup() {
   local src="$HOME"
   local out="$HOME/backups"
   local password="${CHEST_PASSWORD:-}"
+  local password_flag=0
   local use_defaults=1
   local dry_run=0
   local verbose=0
@@ -151,7 +154,7 @@ cmd_backup() {
     case "$1" in
       -s|--source)   need_arg "$@"; src="$2"; shift 2 ;;
       -o|--output)   need_arg "$@"; out="$2"; shift 2 ;;
-      -p|--password) need_arg "$@"; password="$2"; shift 2 ;;
+      -p|--password) need_arg "$@"; password="$2"; password_flag=1; shift 2 ;;
       -r|--recipient) need_arg "$@"; recipients+=("$2"); shift 2 ;;
       -e|--exclude)  need_arg "$@"; cli_excludes+=("$2"); shift 2 ;;
       --no-default-excludes) use_defaults=0; shift ;;
@@ -164,8 +167,23 @@ cmd_backup() {
     esac
   done
 
-  if [ "${#recipients[@]}" -gt 0 ] && [ -n "$password" ]; then
+  if [ "${#recipients[@]}" -gt 0 ] && [ "$password_flag" -eq 1 ]; then
     die "Choose one encryption mode: -p/--password (symmetric) or -r/--recipient (GPG public key), not both."
+  fi
+
+  # CHEST_PASSWORD only ever means "the symmetric passphrase": drop any
+  # inherited value in public-key mode so it can never be mistaken for the
+  # private key's passphrase.
+  if [ "${#recipients[@]}" -gt 0 ]; then
+    password=""
+    local key_matches
+    for r in "${recipients[@]}"; do
+      key_matches="$(gpg --batch --with-colons --list-keys "$r" 2>/dev/null | grep -c '^pub:')" || key_matches=0
+      [ "${key_matches:-0}" -gt 0 ] || die "No public key matches recipient '$r'."
+      if [ "$key_matches" -gt 1 ]; then
+        echo "Warning: recipient '$r' matches $key_matches public keys; gpg encrypts to all of them. Use a fingerprint to be explicit." >&2
+      fi
+    done
   fi
 
   [ -d "$src" ] || die "Source directory '$src' does not exist."
@@ -303,13 +321,14 @@ cmd_restore() {
   local archive=""
   local dest="./restored"
   local password="${CHEST_PASSWORD:-}"
+  local password_flag=0
   local verbose=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
       -i|--input)    need_arg "$@"; archive="$2"; shift 2 ;;
       -o|--output)   need_arg "$@"; dest="$2"; shift 2 ;;
-      -p|--password) need_arg "$@"; password="$2"; shift 2 ;;
+      -p|--password) need_arg "$@"; password="$2"; password_flag=1; shift 2 ;;
       -v|--verbose)  verbose=1; shift ;;
       -h|--help)     usage; exit 0 ;;
       *)             die "Unknown option: $1" ;;
@@ -328,16 +347,23 @@ cmd_restore() {
   # gpg may exit non-zero when it cannot decrypt the packet bodies while
   # listing; only the packet dump matters here, so ignore its exit status.
   packets="$(gpg --batch --pinentry-mode cancel --list-packets "$archive" 2>/dev/null || true)"
+  [ -n "$packets" ] || die "'$archive' is not an OpenPGP-encrypted archive."
   if grep -q ':symkey enc packet:' <<<"$packets"; then
     is_symmetric=1
   fi
 
+  # Decide where the passphrase comes from. CHEST_PASSWORD only applies to
+  # symmetric archives; for public-key archives the private key's passphrase
+  # is the gpg-agent's business unless -p was passed explicitly.
+  local use_loopback=0
   if [ "$is_symmetric" -eq 1 ]; then
     ask_password restore
-  elif [ -n "$password" ]; then
-    # Public-key archive: the password, when given, is used as the private
-    # key's passphrase via fd 3.
-    :
+    use_loopback=1
+  elif [ "$password_flag" -eq 1 ]; then
+    # Explicit -p on a public-key archive: use it as the private key's passphrase.
+    use_loopback=1
+  else
+    password=""
   fi
 
   local progress_args=()
@@ -347,21 +373,51 @@ cmd_restore() {
     progress_args+=(--checkpoint=2500 --checkpoint-action='ttyout=  Extracting: %u\r')
   fi
 
-  mkdir -p "$dest"
+  # Extract into a sibling staging directory and only move it into place once
+  # gpg and tar both succeeded, so a wrong password or a truncated archive
+  # leaves the destination untouched.
+  local staging="${dest%/}.partial.$$"
+  rm -rf "$staging"
+  mkdir -p "$staging"
+  # Expand the path into the trap: the local variable is gone by the time an
+  # EXIT trap fires, which would trip `set -u`.
+  trap "rm -rf $(printf '%q' "$staging")" INT TERM EXIT
+
   echo "Restoring '$archive' -> '$dest'..."
 
-  if [ "$is_symmetric" -eq 1 ] || [ -n "$password" ]; then
+  set +e
+  if [ "$use_loopback" -eq 1 ]; then
     gpg --batch --yes --quiet --no-tty \
         --pinentry-mode loopback --passphrase-fd 3 \
         --decrypt "$archive" 3<<<"$password" \
-      | tar "${progress_args[@]}" -xzpf - -C "$dest"
+      | tar "${progress_args[@]}" -xzpf - -C "$staging"
   else
-    # Public-key archive without a password: let gpg-agent supply the
-    # private key (prompting via its own pinentry if the key is protected).
+    # Public-key archive without a password: gpg-agent supplies the private
+    # key and runs its own pinentry if the passphrase is not cached yet.
+    # --batch only stops gpg itself from asking questions; the agent's
+    # pinentry still works, and unattended runs fail fast instead of hanging.
     gpg --batch --yes --quiet \
         --decrypt "$archive" \
-      | tar "${progress_args[@]}" -xzpf - -C "$dest"
+      | tar "${progress_args[@]}" -xzpf - -C "$staging"
   fi
+  local status=("${PIPESTATUS[@]}")
+  set -e
+  if [ "${status[0]}" -ne 0 ] || [ "${status[1]}" -ne 0 ]; then
+    rm -rf "$staging"
+    trap - INT TERM EXIT
+    if [ "$use_loopback" -eq 0 ] && [ "${status[0]}" -ne 0 ]; then
+      die "Decryption failed. This archive is encrypted to a public key: gpg-agent needs the matching private key, plus a pinentry or a preset passphrase to unlock it (see README section 4)."
+    fi
+    die "Restore failed (gpg=${status[0]}, tar=${status[1]})."
+  fi
+
+  mkdir -p "$dest"
+  shopt -s dotglob nullglob
+  local staged=("$staging"/*)
+  shopt -u dotglob nullglob
+  [ "${#staged[@]}" -eq 0 ] || mv -- "${staged[@]}" "$dest"/
+  trap - INT TERM EXIT
+  rm -rf "$staging"
 
   echo "Restore complete: $dest"
 }
