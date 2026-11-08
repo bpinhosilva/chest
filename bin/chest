@@ -56,7 +56,7 @@ load_exclude_file() {
 usage() {
   cat <<'EOF'
 Usage:
-  chest backup  [-s SOURCE_DIR] [-o OUTPUT_PATH] [-p PASSWORD] [-e PATTERN ...] [--no-default-excludes] [-E FILE] [--no-exclude-file] [--dry-run] [-v]
+  chest backup  [-s SOURCE_DIR] [-o OUTPUT_PATH] [-p PASSWORD | -r RECIPIENT ...] [-e PATTERN ...] [--no-default-excludes] [-E FILE] [--no-exclude-file] [--dry-run] [-v]
   chest restore -i ARCHIVE_FILE [-o RESTORE_DIR] [-p PASSWORD] [-v]
 
 Commands:
@@ -66,7 +66,12 @@ Commands:
 Backup Options:
   -s, --source DIR          Directory to back up (default: $HOME)
   -o, --output PATH         Output directory or .tar.gz.gpg file path (default: $HOME/backups)
-  -p, --password PASS       Encryption password (prompts interactively if omitted)
+  -p, --password PASS       Encryption password for symmetric encryption
+                            (prompts interactively if omitted; $CHEST_PASSWORD is used if set)
+  -r, --recipient KEY       Encrypt to a GPG public key instead of a password
+                            (key ID, fingerprint, or email; can be used multiple times).
+                            Restoring needs the matching private key; no password is
+                            required on the backup machine. Mutually exclusive with -p.
   -e, --exclude PATTERN     Exclude directory/file pattern (can be used multiple times)
       --no-default-excludes Do not use the built-in default excludes (exclude file and -e patterns still apply)
   -E, --exclude-file FILE   File with one exclude pattern per line (default: $HOME/.config/chest/excludes, optional)
@@ -77,8 +82,12 @@ Backup Options:
 Restore Options:
   -i, --input FILE          Encrypted .tar.gz.gpg file to restore (required)
   -o, --output DIR          Directory to extract files into (default: ./restored)
-  -p, --password PASS       Decryption password (prompts interactively if omitted)
+  -p, --password PASS       Decryption password for symmetric archives
+                            (prompts interactively if omitted; $CHEST_PASSWORD is used if set)
   -v, --verbose             Print each file path as it is restored
+
+The archive type (symmetric password vs. GPG public key) is detected
+automatically during restore; no extra flag is needed.
 
 Examples:
   # Preview estimated backup size in GB
@@ -87,7 +96,10 @@ Examples:
   # Backup a folder with a CLI password, extra excludes, and verbose file output
   chest backup -s ~/Documents -o ~/backups -p "mysecret" -e "*.iso" -v
 
-  # Restore a backup
+  # Backup encrypted to a GPG public key (passwordless, ideal for unattended runs)
+  chest backup -s ~/Documents -o ~/backups -r you@example.com
+
+  # Restore a backup (password or private key is picked up automatically)
   chest restore -i ~/backups/Documents_20261017_120000.tar.gz.gpg -o /tmp/restore -p "mysecret"
 EOF
 }
@@ -126,19 +138,21 @@ ask_password() {
 cmd_backup() {
   local src="$HOME"
   local out="$HOME/backups"
-  local password=""
+  local password="${CHEST_PASSWORD:-}"
   local use_defaults=1
   local dry_run=0
   local verbose=0
   local cli_excludes=()
   local exclude_file=""
   local use_exclude_file=1
+  local recipients=()
 
   while [ $# -gt 0 ]; do
     case "$1" in
       -s|--source)   need_arg "$@"; src="$2"; shift 2 ;;
       -o|--output)   need_arg "$@"; out="$2"; shift 2 ;;
       -p|--password) need_arg "$@"; password="$2"; shift 2 ;;
+      -r|--recipient) need_arg "$@"; recipients+=("$2"); shift 2 ;;
       -e|--exclude)  need_arg "$@"; cli_excludes+=("$2"); shift 2 ;;
       --no-default-excludes) use_defaults=0; shift ;;
       --no-exclude-file) use_exclude_file=0; shift ;;
@@ -149,6 +163,10 @@ cmd_backup() {
       *)             die "Unknown option: $1" ;;
     esac
   done
+
+  if [ "${#recipients[@]}" -gt 0 ] && [ -n "$password" ]; then
+    die "Choose one encryption mode: -p/--password (symmetric) or -r/--recipient (GPG public key), not both."
+  fi
 
   [ -d "$src" ] || die "Source directory '$src' does not exist."
 
@@ -226,7 +244,9 @@ cmd_backup() {
     return 0
   fi
 
-  ask_password backup
+  if [ "${#recipients[@]}" -eq 0 ]; then
+    ask_password backup
+  fi
 
   # Determine output archive filename
   local archive_file=""
@@ -251,11 +271,24 @@ cmd_backup() {
   umask 077
   trap 'rm -f "$archive_file"' INT TERM EXIT
   set +e
-  tar --warning=no-file-changed --ignore-failed-read "${progress_args[@]}" -czpf - "${exclude_args[@]}" -C "$parent_dir" "$base_name" \
-    | gpg --batch --yes --quiet --no-tty \
-          --pinentry-mode loopback --passphrase-fd 3 \
-          --symmetric --cipher-algo AES256 \
-          --output "$archive_file" 3<<<"$password"
+  if [ "${#recipients[@]}" -gt 0 ]; then
+    local gpg_args=()
+    for r in "${recipients[@]}"; do
+      gpg_args+=(--recipient "$r")
+    done
+    tar --warning=no-file-changed --ignore-failed-read "${progress_args[@]}" -czpf - "${exclude_args[@]}" -C "$parent_dir" "$base_name" \
+      | gpg --batch --yes --quiet --no-tty \
+            --trust-model always \
+            --encrypt --cipher-algo AES256 \
+            "${gpg_args[@]}" \
+            --output "$archive_file"
+  else
+    tar --warning=no-file-changed --ignore-failed-read "${progress_args[@]}" -czpf - "${exclude_args[@]}" -C "$parent_dir" "$base_name" \
+      | gpg --batch --yes --quiet --no-tty \
+            --pinentry-mode loopback --passphrase-fd 3 \
+            --symmetric --cipher-algo AES256 \
+            --output "$archive_file" 3<<<"$password"
+  fi
   local status=("${PIPESTATUS[@]}")
   set -e
   if [ "${status[0]}" -gt 1 ] || [ "${status[1]}" -ne 0 ]; then
@@ -269,7 +302,7 @@ cmd_backup() {
 cmd_restore() {
   local archive=""
   local dest="./restored"
-  local password=""
+  local password="${CHEST_PASSWORD:-}"
   local verbose=0
 
   while [ $# -gt 0 ]; do
@@ -285,7 +318,27 @@ cmd_restore() {
 
   [ -n "$archive" ] || die "Missing input archive (-i / --input)."
   [ -f "$archive" ] || die "Archive '$archive' does not exist."
-  ask_password restore
+
+  # Detect the archive's encryption mode from its OpenPGP packets:
+  # a ':symkey enc packet:' means passphrase (symmetric) encryption;
+  # otherwise the archive was encrypted to a GPG public key.
+  # gpg --list-packets does not need the password to inspect packets.
+  local is_symmetric=0
+  local packets
+  # gpg may exit non-zero when it cannot decrypt the packet bodies while
+  # listing; only the packet dump matters here, so ignore its exit status.
+  packets="$(gpg --batch --list-packets "$archive" 2>/dev/null || true)"
+  if grep -q ':symkey enc packet:' <<<"$packets"; then
+    is_symmetric=1
+  fi
+
+  if [ "$is_symmetric" -eq 1 ]; then
+    ask_password restore
+  elif [ -n "$password" ]; then
+    # Public-key archive: the password, when given, is used as the private
+    # key's passphrase via fd 3.
+    :
+  fi
 
   local progress_args=()
   if [ "$verbose" -eq 1 ]; then
@@ -297,10 +350,18 @@ cmd_restore() {
   mkdir -p "$dest"
   echo "Restoring '$archive' -> '$dest'..."
 
-  gpg --batch --yes --quiet --no-tty \
-      --pinentry-mode loopback --passphrase-fd 3 \
-      --decrypt "$archive" 3<<<"$password" \
-    | tar "${progress_args[@]}" -xzpf - -C "$dest"
+  if [ "$is_symmetric" -eq 1 ] || [ -n "$password" ]; then
+    gpg --batch --yes --quiet --no-tty \
+        --pinentry-mode loopback --passphrase-fd 3 \
+        --decrypt "$archive" 3<<<"$password" \
+      | tar "${progress_args[@]}" -xzpf - -C "$dest"
+  else
+    # Public-key archive without a password: let gpg-agent supply the
+    # private key (prompting via its own pinentry if the key is protected).
+    gpg --batch --yes --quiet \
+        --decrypt "$archive" \
+      | tar "${progress_args[@]}" -xzpf - -C "$dest"
+  fi
 
   echo "Restore complete: $dest"
 }

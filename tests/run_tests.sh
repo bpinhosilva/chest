@@ -176,4 +176,34 @@ fi
 pass "Missing explicit exclude file rejected"
 rm -f "$EX_DEFAULT"
 
+# 13. Asymmetric (GPG public key) encryption via -r/--recipient
+KEY_EMAIL="chest-test@example.com"
+gpg --batch --passphrase '' --pinentry-mode loopback --quick-gen-key "$KEY_EMAIL" default default never >/dev/null 2>&1 \
+  || fail "test setup: GPG key generation failed"
+KEY_FPR="$(gpg --list-keys --with-colons "$KEY_EMAIL" | awk -F: '/^fpr:/ {print $10; exit}')"
+[ -n "$KEY_FPR" ] || fail "test setup: could not read generated key fingerprint"
+
+ARCHIVE_KEY="${OUT}/key.tar.gz.gpg"
+RESTORE_KEY="${TMP_ROOT}/restored_key"
+"$CHEST" backup -s "$SRC" -o "$ARCHIVE_KEY" -r "$KEY_EMAIL"
+[ -f "$ARCHIVE_KEY" ] || fail "Public-key backup archive not created"
+# Restore without any password: the type is auto-detected and the private key is used
+"$CHEST" restore -i "$ARCHIVE_KEY" -o "$RESTORE_KEY"
+[ "$(cat "$RESTORE_KEY/data/file.txt")" = "hello world" ] || fail "Public-key restore failed"
+pass "Public-key encryption (-r) and passwordless auto-detected restore"
+
+# 13b. -p and -r together are rejected
+if "$CHEST" backup -s "$SRC" -o "${TMP_ROOT}/both.tar.gz.gpg" -p "x" -r "$KEY_EMAIL" >/dev/null 2>&1; then
+  fail "-p and -r together should fail"
+fi
+pass "-p and -r mutual exclusion enforced"
+
+# 14. CHEST_PASSWORD environment variable
+ARCHIVE_ENV="${OUT}/env.tar.gz.gpg"
+RESTORE_ENV="${TMP_ROOT}/restored_env"
+CHEST_PASSWORD="envpass456" "$CHEST" backup -s "$SRC" -o "$ARCHIVE_ENV"
+CHEST_PASSWORD="envpass456" "$CHEST" restore -i "$ARCHIVE_ENV" -o "$RESTORE_ENV"
+[ "$(cat "$RESTORE_ENV/data/file.txt")" = "hello world" ] || fail "CHEST_PASSWORD backup/restore failed"
+pass "CHEST_PASSWORD environment variable verified"
+
 echo "All tests passed!"
