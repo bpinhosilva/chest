@@ -1,0 +1,18 @@
+# ~/.config/systemd/user/chest-backup.service
+# Weekly encrypted backup, run as your own user (no root needed).
+# Install together with chest-backup.timer. See README section 7.
+
+[Unit]
+Description=chest encrypted backup
+
+[Service]
+Type=oneshot
+# Symmetric mode: source the password file (chmod 600, owned by you).
+# Delete this line when using public-key encryption (-r) instead.
+EnvironmentFile=%h/.config/chest/env
+ExecStart=%h/.local/bin/chest backup -s %h -o %h/backups
+# Public-key mode alternative (no secret on this machine):
+# ExecStart=%h/.local/bin/chest backup -s %h -o %h/backups -r you@example.com
+
+[Install]
+WantedBy=default.target

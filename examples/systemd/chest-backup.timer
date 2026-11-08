@@ -1,0 +1,14 @@
+# ~/.config/systemd/user/chest-backup.timer
+# Fires chest-backup.service weekly (Saturday 02:00). Install with:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now chest-backup.timer
+
+[Unit]
+Description=Run chest backup weekly
+
+[Timer]
+OnCalendar=Sat 02:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

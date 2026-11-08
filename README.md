@@ -47,10 +47,46 @@ chest backup -s ~/Documents -o ~/backups -p "mySecretPassword" -v
 
 # Or specify an exact output file name (any -o path ending in .gpg or .enc)
 chest backup -s /etc -o ~/backups/etc-backup.tar.gz.gpg -p "mySecretPassword"
+
+# Back up encrypted to a GPG public key instead of a password (see section 4)
+chest backup -s ~/Documents -o ~/backups -r you@example.com
 ```
 
 - **Password prompt**: If you omit `-p`, the script prompts you interactively (with confirmation on backup) so your password won't appear in your shell history.
 - **Progress & Verbose (`-v` / `--verbose`)**: By default, `chest` shows a live progress status line in the terminal and total bytes written. Pass `-v` to print every file path as it is processed.
+
+### Unattended Runs (cron / systemd)
+
+For scheduled backups, avoid `-p` on the command line (it leaks the password to shell history and `ps`). Two safer options:
+
+**Environment variable:** `chest` reads `CHEST_PASSWORD` when `-p` is omitted. Keep the secret in a file only you can read and source it:
+
+```bash
+# ~/.config/chest/env  (chmod 600, owned by your user)
+CHEST_PASSWORD=mySecretPassword
+```
+
+```bash
+# crontab — no secret in the crontab itself
+0 2 * * * . "$HOME/.config/chest/env" && chest backup
+```
+
+**GPG public key (recommended):** with `-r` the backup machine needs no secret at all — see section 4.
+
+### Scheduling with systemd (weekly)
+
+Sample user units are provided in [`examples/systemd/`](examples/systemd). Copy them to `~/.config/systemd/user/`, adjust the `ExecStart` line if needed, then:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now chest-backup.timer
+
+# Check it
+systemctl --user list-timers chest-backup.timer
+journalctl --user -u chest-backup.service
+```
+
+`Persistent=true` makes up a missed run (machine off at the scheduled time) fire at the next boot. For a root-level system timer instead, place the units in `/etc/systemd/system/` and use `systemctl` without `--user`.
 
 ### 2. Ignore Cache & Temp Directories
 
@@ -104,17 +140,41 @@ Notes:
 - `--no-exclude-file` ignores the exclude file entirely.
 - Directories containing a `CACHEDIR.TAG` file are skipped whenever built-in defaults are enabled, even if the exclude file is empty or custom.
 
-### 4. Restore a Backup
+### 4. GPG Public-Key Encryption (optional)
 
-Pass the encrypted archive (`-i`), the target directory (`-o`), and the password (`-p`), with optional `-v` for verbose file listing:
+Instead of a password, you can encrypt backups to a GPG **public key** with `-r` / `--recipient` (key ID, fingerprint, or email; repeatable for multiple recipients). This is ideal for unattended backups: the machine running the backup holds no secret — only the private key can decrypt.
+
+```bash
+# On the backup machine: import the public key once, then back up
+gpg --import backup-public-key.asc
+chest backup -s ~/Documents -o ~/backups -r you@example.com
+```
+
+- **Restore** requires the matching private key (plus its passphrase, cached by gpg-agent). The archive type is detected automatically, so restore works the same way — just omit `-p`:
+
+```bash
+# On the restore machine: import the private key once, then restore
+gpg --import private-key.asc
+chest restore -i ~/backups/Documents_20261017_153000.tar.gz.gpg -o /tmp/restored
+```
+
+- `-p` and `-r` are mutually exclusive; pick one mode per backup.
+- Losing the private key means losing every key-encrypted archive — keep a safe offline copy (or add a second `-r` recipient as a recovery key).
+
+### 5. Restore a Backup
+
+Pass the encrypted archive (`-i`), the target directory (`-o`), and the password (`-p`) if it was symmetrically encrypted, with optional `-v` for verbose file listing. The encryption type is detected automatically — public-key archives need only the private key, no `-p`:
 
 ```bash
 chest restore -i ~/backups/user_20261017_153000.tar.gz.gpg -o /tmp/restored -p "mySecretPassword" -v
+
+# Public-key archive: no password needed
+chest restore -i ~/backups/user_20261017_153000.tar.gz.gpg -o /tmp/restored
 ```
 
-### 5. Manual Decryption (Without `chest`)
+### 6. Manual Decryption (Without `chest`)
 
-Archives are standard `gpg` + `tar.gz` files, so you can always restore them manually on any Linux machine:
+Archives are standard `gpg` + `tar.gz` files, so you can always restore them manually on any Linux machine (for public-key archives, the private key must be in the keyring):
 
 ```bash
 mkdir -p /tmp/restored
